@@ -23,7 +23,7 @@
 |-------|--------|------------|
 | 1 — Planning & Architecture | ✅ Complete | 100% (3/3 milestones) |
 | 2 — Environment & Infrastructure | 🔶 In Progress | ~70% (core scaffolding, deps, secrets, config done; pre-flight check pending) |
-| 3 — Baseline Execution | ⬜ Not Started | 0% |
+| 3 — Baseline Execution | 🔶 In Progress | Script implemented + control-flow verified; real execution (3.2) pending go-ahead |
 | 4 — AirLLM Execution | ⬜ Not Started | 0% |
 | 5 — Metrics & Visualization | ⬜ Not Started | 0% |
 | 6 — FinOps & Economic Analysis | ⬜ Not Started | 0% |
@@ -76,7 +76,7 @@
 - [x] Run `uv python pin 3.12` → `.python-version` created
 - [x] Run `uv init --name zerovram-airllm-engine --no-readme --no-workspace` (the user's home directory has an unrelated parent `uv` workspace; `--no-workspace` was required to keep this project standalone)
 - [x] Run `uv venv` → `.venv/` created (via first `uv add`) and confirmed gitignored
-- [ ] Create `src/engine/{__init__.py,loader.py,infer.py,benchmark.py}` and `scripts/run_inference.py` — **deferred to Phase 3/4**, created when the baseline and AirLLM scripts are actually implemented, not as empty stubs ahead of need
+- [x] Module layout decided as it's actually built, not pre-scaffolded: a flat `src/` package (`src/config.py`, `src/baseline.py`, ...) rather than the nested `src/engine/` sketched in `docs/PLAN.md` §4.4. AirLLM/inference/benchmark modules will follow the same flat convention in Phase 4/5 unless that stops scaling.
 
 **Definition of Done:** `uv venv` exits `0`; `.venv/` is gitignored. ✅ **Verified** (engine module stubs intentionally deferred — see note above).
 
@@ -105,7 +105,8 @@
 - [x] Define base paths as `pathlib.Path` fields, all derived dynamically from `Path(__file__).resolve().parent.parent` (no hardcoded absolute paths): `project_root`, `models_dir`, `logs_dir`, `results_dir`, `hf_cache_dir`
 - [x] `ensure_directories()` helper to create the runtime data dirs on demand
 - [x] `get_settings()` — `lru_cache`-wrapped singleton accessor
-- [ ] `DEFAULT_MODEL_ID` / `FALLBACK_MODEL_ID` / `QUANT_CONFIG` / `MIN_AVAILABLE_RAM_GB` — deferred to Phase 3/4 (Model Selection / AirLLM Execution), where they are actually consumed
+- [x] `model_id` (default `Qwen/Qwen2.5-7B-Instruct`) and `max_new_tokens` (default `50`) added as overridable `Settings` fields, consumed by `src/baseline.py` (Phase 3)
+- [ ] `FALLBACK_MODEL_ID` / `QUANT_CONFIG` / `MIN_AVAILABLE_RAM_GB` — still deferred to Phase 4 (AirLLM Execution), where they are actually consumed
 
 **Definition of Done:** `HUGGING_FACE_TOKEN=<value> uv run python -c "from src.config import get_settings; s = get_settings(); print(s.project_root)"` runs with no error and resolves to the repo root with no hardcoded path; file is 41 lines (well under the 150-line V3 ceiling). ✅ **Verified.**
 
@@ -121,19 +122,27 @@
 
 **Goal:** Empirically demonstrate the memory-bound failure mode described in PRD §2.1–§2.2.
 
-### Milestone 3.1 — Native Loading Script
-- [ ] Implement `scripts/run_baseline.py`
-- [ ] Load selected model via plain `transformers.AutoModelForCausalLM.from_pretrained(model_id, device_map="cpu", torch_dtype=torch.float16)` — **no AirLLM, no quantization**
-- [ ] Wire a background RSS sampler (1 Hz, via `psutil`) writing to `results/baseline_rss.csv`
-- [ ] Wire stderr/stdout capture to `results/baseline_stderr.log`
+> **Architecture note:** Per explicit direction for this phase, the baseline script lives at the top-level `src/baseline.py` (not `scripts/run_baseline.py` as originally sketched in `docs/PLAN.md` §4). `model_id` and `max_new_tokens` were promoted into `src/config.py` as `Settings` fields rather than hardcoded in the script, consistent with the centralized-configuration architecture established in Phase 2.
 
-**Definition of Done:** `scripts/run_baseline.py` runs end-to-end (regardless of crash/success) and always leaves behind a partial-or-complete `results/baseline_rss.csv`, even on `SIGKILL`.
+### Milestone 3.1 — Native Loading Script
+- [x] Implement `src/baseline.py` (148 lines — under the 150-line V3 ceiling)
+- [x] Load the configured model via plain `transformers.AutoModelForCausalLM.from_pretrained(model_id, device_map="cpu", torch_dtype=torch.float16)` — **no AirLLM, no quantization**
+- [x] Load HF token and paths from `src/config.py` (`get_settings()`); no hardcoded secrets or paths
+- [x] Measure TTFT and TPOT via a `TextIteratorStreamer` + background generation thread, timestamping the first streamed chunk and the inter-token gap thereafter
+- [x] Wrap model load and generation in **separate** `try/except` blocks catching `MemoryError`, `RuntimeError` (allocator OOM), and `KeyboardInterrupt`; each path logs explicitly (to `logs/baseline.log` + stdout) and writes a status-tagged `results/baseline_metrics.json` before returning a distinct exit code (`137` OOM, `1` runtime error, `130` interrupted, `0` success)
+- [x] Peak RSS captured via stdlib `resource.getrusage(...).ru_maxrss` (no new dependency) and included in every result, success or failure
+- [ ] Background 1 Hz RSS-over-time CSV sampler (`results/baseline_rss.csv`) — **not implemented this pass**; out of scope for what was asked (single peak-RSS snapshot was used instead). Add only if Phase 5's RSS-growth-curve chart specifically requires the time series.
+- [x] Unit-verified: control flow exercised with a monkeypatched `load_model_and_tokenizer` raising `MemoryError` → confirmed exit code `137`, error logged, `results/baseline_metrics.json` written with `status: "oom_at_load"`
+
+**Definition of Done:** `src/baseline.py` runs end-to-end on both the success and failure paths (verified via monkeypatch on the failure path) and always leaves behind a `results/baseline_metrics.json`, even when the load fails. ✅ **Verified for catchable failures.** Note: a true OOM-killer `SIGKILL` cannot be caught by Python at all — this is documented in the module docstring, not silently assumed away.
 
 ### Milestone 3.2 — Execute and Capture Failure
-- [ ] Run: `uv run python scripts/run_baseline.py 2>&1 | tee results/baseline_stderr.log`
+- [ ] Run for real against the configured model: `uv run python -m src.baseline`
 - [ ] Record exit code (`echo $?`)
-- [ ] Confirm failure signature: `MemoryError`, allocator `RuntimeError`, or OOM-killer `SIGKILL` (exit 137)
+- [ ] Confirm failure signature: `MemoryError`, allocator `RuntimeError`, or OOM-killer `SIGKILL` (exit 137) — **or** a successful-but-slow completion
 - [ ] **If the load unexpectedly succeeds:** escalate to `torch_dtype=torch.float32` (28 GB footprint) to force the bottleneck deterministically; document the escalation
+
+**This is a real, multi-GB model download and a potentially long-running / resource-intensive run — not executed automatically; awaiting explicit go-ahead to run it for real.**
 
 ### Milestone 3.3 — Crawl-Path Contingency (If No Crash Occurs)
 - [ ] If the baseline does **not** crash, measure TTFT (`time.perf_counter()` delta to first token) and TPOT on the slow CPU-resident path
