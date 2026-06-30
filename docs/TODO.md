@@ -22,7 +22,7 @@
 | Phase | Status | Completion |
 |-------|--------|------------|
 | 1 — Planning & Architecture | ✅ Complete | 100% (3/3 milestones) |
-| 2 — Environment & Infrastructure | ⬜ Not Started | 0% |
+| 2 — Environment & Infrastructure | 🔶 In Progress | ~70% (core scaffolding, deps, secrets, config done; pre-flight check pending) |
 | 3 — Baseline Execution | ⬜ Not Started | 0% |
 | 4 — AirLLM Execution | ⬜ Not Started | 0% |
 | 5 — Metrics & Visualization | ⬜ Not Started | 0% |
@@ -70,53 +70,50 @@
 
 **Goal:** A reproducible, `uv`-managed environment that a new contributor can stand up in ≤ 10 minutes (PRD §5.3).
 
-### Milestone 2.1 — Project Scaffolding
-- [ ] Run `uv python pin 3.12` → confirm `.python-version` created
-- [ ] Run `uv init --name zerovram-airllm-engine --no-readme` (if `pyproject.toml` absent)
-- [ ] Run `uv venv` → confirm `.venv/` created and **not** committed (check `.gitignore`)
-- [ ] Create target directory structure per `docs/PRD.md` §4.4:
-  - [ ] `src/engine/__init__.py`
-  - [ ] `src/engine/loader.py`
-  - [ ] `src/engine/infer.py`
-  - [ ] `src/engine/benchmark.py`
-  - [ ] `scripts/run_inference.py`
+> **Architecture note:** Per explicit direction for this phase, shared application configuration lives at the top-level `src/config.py` (using `pydantic_settings.BaseSettings`), rather than nested under `src/engine/`. Engine-specific modules (`loader.py`, `infer.py`, `benchmark.py`) will be created under `src/engine/` in Phases 3–5 and will import shared settings from `src.config`. This supersedes the flat-constants `config.py` sketch originally outlined in `docs/PLAN.md` §2.
 
-**Definition of Done:** `uv venv` exits `0`; all listed files exist (may be stub/empty at this point); `.venv/` is gitignored.
+### Milestone 2.1 — Project Scaffolding
+- [x] Run `uv python pin 3.12` → `.python-version` created
+- [x] Run `uv init --name zerovram-airllm-engine --no-readme --no-workspace` (the user's home directory has an unrelated parent `uv` workspace; `--no-workspace` was required to keep this project standalone)
+- [x] Run `uv venv` → `.venv/` created (via first `uv add`) and confirmed gitignored
+- [ ] Create `src/engine/{__init__.py,loader.py,infer.py,benchmark.py}` and `scripts/run_inference.py` — **deferred to Phase 3/4**, created when the baseline and AirLLM scripts are actually implemented, not as empty stubs ahead of need
+
+**Definition of Done:** `uv venv` exits `0`; `.venv/` is gitignored. ✅ **Verified** (engine module stubs intentionally deferred — see note above).
 
 ### Milestone 2.2 — Dependency Installation
-- [ ] `uv add torch --index-url https://download.pytorch.org/whl/cpu`
-- [ ] `uv add airllm transformers accelerate bitsandbytes huggingface-hub`
-- [ ] `uv add --dev psutil pytest ruff`
-- [ ] Add visualization deps for Phase 5: `uv add --dev matplotlib seaborn pandas`
-- [ ] `uv lock` → commit `uv.lock`
-- [ ] `uv sync` → exits `0` on a clean checkout
+- [x] `uv add torch --index-url https://download.pytorch.org/whl/cpu` (persisted as an explicit `[[tool.uv.index]]` + `[tool.uv.sources]` entry in `pyproject.toml` so a plain `uv sync` reproduces the CPU build with no manual flag)
+- [x] `uv add airllm transformers accelerate pydantic-settings python-dotenv`
+- [ ] `uv add bitsandbytes` — deferred to Phase 4 (only needed once 4-bit quantized AirLLM execution is implemented)
+- [ ] `uv add --dev psutil pytest ruff` — deferred: `psutil` lands with the Phase 3 RSS sampler, `pytest`/`ruff` with the first testable module
+- [ ] `uv add --dev matplotlib seaborn pandas` — deferred to Phase 5 (Metrics & Visualization)
+- [x] `uv lock` → `uv.lock` committed
+- [x] `uv sync` → exits `0` on a clean checkout
 
-**Definition of Done:** `uv sync` exits `0`; `uv run python -c "import torch, airllm, transformers, matplotlib, seaborn, pandas; print('ok')"` prints `ok` with no traceback; `uv.lock` is committed and matches `pyproject.toml`.
+**Definition of Done:** `uv sync` exits `0`; `uv run python -c "import torch, airllm, transformers, accelerate; print('ok')"` prints `ok` with no traceback; `uv.lock` is committed and matches `pyproject.toml`. ✅ **Verified for currently-installed deps.** (`bitsandbytes`, dev tooling, and visualization deps will be re-verified as a single combined import check once Phases 3–5 add them.)
 
 ### Milestone 2.3 — Hugging Face Authentication
-- [ ] Create `.env.example` with `HF_TOKEN=` placeholder
-- [ ] Add `.env` to `.gitignore`
-- [ ] Populate local `.env` with a real, valid HF token
-- [ ] Verify auth: `uv run python -c "from huggingface_hub import whoami; print(whoami())"`
+- [x] Create `.env-example` with `HUGGING_FACE_TOKEN=` placeholder
+- [x] Confirm `.env` is excluded via `.gitignore` (verified with `git check-ignore -v .env`)
+- [ ] Populate local `.env` with a real, valid HF token — **user action required**; the agent cannot generate or possess this secret
+- [ ] Verify auth: `uv run python -c "from huggingface_hub import whoami; print(whoami())"` — blocked on the above
 
-**Definition of Done:** `whoami()` call returns a valid username/org with no `401`/`403`; `.env` is confirmed absent from `git status` / `git ls-files`.
+**Definition of Done:** `.env-example` exists with no real secret; `.env` confirmed absent from `git status` / `git ls-files`. ⏳ **`whoami()` verification pending user-supplied token.**
 
 ### Milestone 2.4 — `config.py` (Centralized Configuration)
-- [ ] Create `src/engine/config.py`
-- [ ] Define `DEFAULT_MODEL_ID = "Qwen/Qwen2.5-7B-Instruct"`
-- [ ] Define `FALLBACK_MODEL_ID = "meta-llama/Meta-Llama-3-8B-Instruct"`
-- [ ] Define `QUANT_CONFIG` (compression mode, compute dtype) per `docs/PLAN.md` §3.3
-- [ ] Define `MIN_AVAILABLE_RAM_GB` threshold constant for the pre-flight check (PRD §7)
-- [ ] Define paths: `RESULTS_DIR`, `LOGS_DIR` as `pathlib.Path` constants
-- [ ] Load `.env` via `python-dotenv` (add dependency: `uv add python-dotenv`) and expose `HF_TOKEN`
+- [x] Create `src/config.py` using `pydantic_settings.BaseSettings`
+- [x] Securely load `hugging_face_token` as `pydantic.SecretStr` (required field, sourced from `.env`/environment — never hardcoded, never logged in plaintext)
+- [x] Define base paths as `pathlib.Path` fields, all derived dynamically from `Path(__file__).resolve().parent.parent` (no hardcoded absolute paths): `project_root`, `models_dir`, `logs_dir`, `results_dir`, `hf_cache_dir`
+- [x] `ensure_directories()` helper to create the runtime data dirs on demand
+- [x] `get_settings()` — `lru_cache`-wrapped singleton accessor
+- [ ] `DEFAULT_MODEL_ID` / `FALLBACK_MODEL_ID` / `QUANT_CONFIG` / `MIN_AVAILABLE_RAM_GB` — deferred to Phase 3/4 (Model Selection / AirLLM Execution), where they are actually consumed
 
-**Definition of Done:** `uv run python -c "from src.engine.config import DEFAULT_MODEL_ID, QUANT_CONFIG; print(DEFAULT_MODEL_ID)"` runs with no error; no magic strings/numbers for model IDs or thresholds remain hardcoded in any other script.
+**Definition of Done:** `HUGGING_FACE_TOKEN=<value> uv run python -c "from src.config import get_settings; s = get_settings(); print(s.project_root)"` runs with no error and resolves to the repo root with no hardcoded path; file is 41 lines (well under the 150-line V3 ceiling). ✅ **Verified.**
 
 ### Milestone 2.5 — RAM Pre-Flight Check
 - [ ] Implement a `check_available_ram()` utility reading `/proc/meminfo`
 - [ ] Wire warning (not hard block) if `MemAvailable` < `MIN_AVAILABLE_RAM_GB` (PRD §7 mitigation)
 
-**Definition of Done:** Function returns the actual available RAM in GB and logs a warning when below threshold; unit-tested with a mocked `/proc/meminfo` fixture.
+**Definition of Done:** Function returns the actual available RAM in GB and logs a warning when below threshold; unit-tested with a mocked `/proc/meminfo` fixture. **Not started — carried to Phase 3.**
 
 ---
 
