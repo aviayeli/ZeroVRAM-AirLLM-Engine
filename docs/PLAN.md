@@ -1,7 +1,7 @@
 # Implementation Plan
 ## ZeroVRAM-AirLLM-Engine (EX05)
 
-**Version:** 1.0.0
+**Version:** 1.1.0
 **Status:** Draft
 **Author:** Avi Ayeli
 **Date:** 2026-06-30
@@ -17,14 +17,15 @@
 4. [Phase 3 — Baseline Execution (OOM Demonstration)](#4-phase-3--baseline-execution-oom-demonstration)
 5. [Phase 4 — AirLLM Execution](#5-phase-4--airllm-execution)
 6. [Phase 5 — Metrics, Evaluation & Reporting](#6-phase-5--metrics-evaluation--reporting)
-7. [Definition of Done](#7-definition-of-done)
-8. [Risk Carry-Forward](#8-risk-carry-forward)
+7. [Phase 6 — Economic Analysis](#7-phase-6--economic-analysis)
+8. [Definition of Done](#8-definition-of-done)
+9. [Risk Carry-Forward](#9-risk-carry-forward)
 
 ---
 
 ## 1. Plan Overview
 
-This plan decomposes the PRD into five sequential, gated phases. Each phase has explicit **entry criteria**, **exit criteria**, **deliverables**, and **commands**. A phase may not start until the prior phase's exit criteria are met — this is a linear experiment pipeline, not a parallelizable workstream, because Phase 3's failure mode (the OOM crash) is the empirical baseline that Phase 4 is measured against.
+This plan decomposes the PRD into six sequential, gated phases. Each phase has explicit **entry criteria**, **exit criteria**, **deliverables**, and **commands**. A phase may not start until the prior phase's exit criteria are met — this is a linear experiment pipeline, not a parallelizable workstream, because Phase 3's failure mode (the OOM crash) is the empirical baseline that Phase 4 is measured against, and Phase 6's cost model depends on Phase 5's measured throughput.
 
 | Phase | Name | Maps to PRD Objective(s) | Est. Effort |
 |-------|------|---------------------------|--------------|
@@ -33,6 +34,7 @@ This plan decomposes the PRD into five sequential, gated phases. Each phase has 
 | 3 | Baseline Execution (OOM Demonstration) | O4 | 0.5 day |
 | 4 | AirLLM Execution | O1, O2, O3 | 1 day |
 | 5 | Metrics, Evaluation & Reporting | O3, O4, O6 | 1 day |
+| 6 | Economic Analysis | O6 (extension) | 0.5 day |
 
 **Engineering standard:** All commands in this plan use `uv` exclusively (per PRD §4.3 — `pip`/`conda` are disallowed). All scripts are typed (PEP 604 unions, no bare `Any` in public signatures), fail loudly (no silent `except: pass`), and every phase produces a durable artifact under `docs/` or `results/` so the experiment is auditable after the fact.
 
@@ -96,20 +98,30 @@ Default to **`Qwen2.5-7B-Instruct`** for the primary experiment run (ungated →
 | Quantization scope | All transformer block linear layers; embeddings/lm_head left at higher precision | AirLLM default behavior; preserves output quality at the vocabulary projection |
 | Compression flag | `compression="4bit"` passed to `AutoModel.from_pretrained` (AirLLM API) | Required for AirLLM's layer-paging quantized path used in Phase 4 |
 
-### 3.4 Steps
+### 3.4 Weight Format Selection (SafeTensors vs. GGUF)
+
+| Format | Use With | Decision |
+|--------|----------|----------|
+| **SafeTensors** | AirLLM's native `transformers`-based layer-splitting path (`AutoModel.from_pretrained`) | **Primary format.** AirLLM's mmap-based layer-by-layer loader (Phase 4) is built on the SafeTensors zero-copy mmap interface — this is the format that makes the on-demand paging strategy work at all, since each shard can be mapped independently without deserializing the full checkpoint |
+| **GGUF** | `llama.cpp`-style CPU-quantized inference (e.g., `llama-cpp-python`) | **Evaluated as a secondary/comparison path only**, not the primary pipeline. GGUF's block-quantized (Q4_K_M) format is a legitimate alternative for fitting an 8B model in 16 GB RAM, and may be benchmarked in Phase 5 as a reference point against AirLLM, but it bypasses AirLLM's layer-paging mechanism entirely and is therefore out of scope for Phase 4's core experiment |
+
+**Rationale:** SafeTensors is required for the AirLLM mmap path that this project exists to validate (PRD §1, §2.3). GGUF is documented here so the choice is explicit and auditable, not because both formats are used interchangeably — using GGUF would mean testing `llama.cpp`, not AirLLM.
+
+### 3.5 Steps
 
 | # | Step |
 |---|------|
 | 2.1 | Set `HF_TOKEN` in `.env`; run pre-flight `huggingface-cli whoami` equivalent via `uv run python -c "from huggingface_hub import whoami; print(whoami())"` |
 | 2.2 | Download/cache tokenizer + config only (no weights yet) for both candidates to confirm repo access |
-| 2.3 | Record disk footprint estimate per candidate against the ≥ 30 GB free space requirement (PRD §4.1) |
-| 2.4 | Document final model choice and fallback chain in `docs/PLAN.md` execution log |
+| 2.3 | Confirm each candidate repo publishes SafeTensors weights (not pickle-only `.bin`) — required for the AirLLM mmap path in Phase 4 |
+| 2.4 | Record disk footprint estimate per candidate against the ≥ 30 GB free space requirement (PRD §4.1) |
+| 2.5 | Document final model choice, format decision, and fallback chain in `docs/PLAN.md` execution log |
 
-### 3.5 Deliverables
+### 3.6 Deliverables
 - `src/engine/loader.py`: model name + quantization config defined as named constants (e.g., `DEFAULT_MODEL_ID`, `FALLBACK_MODEL_ID`, `QUANT_CONFIG`).
 
-### 3.6 Exit Criteria (Gate to Phase 3)
-- Selected model ID(s) confirmed accessible (tokenizer/config fetch succeeds, no 401/403).
+### 3.7 Exit Criteria (Gate to Phase 3)
+- Selected model ID(s) confirmed accessible (tokenizer/config fetch succeeds, no 401/403) and confirmed to publish SafeTensors weights.
 - Disk space verified sufficient for full fp16 download (needed for Phase 3's native attempt) **and** the quantized cache.
 
 ---
@@ -191,40 +203,79 @@ This phase exists to **empirically demonstrate the failure mode** described in P
 
 | # | Step | Detail |
 |---|------|--------|
-| 5.1 | Implement `src/engine/benchmark.py` | Defines `measure_ttft()`, `measure_tpot()`, and `sample_rss()` as composable utilities (no duplication with Phase 3/4 ad-hoc sampling — Phase 3/4 scripts should import from this module once it exists) |
+| 5.1 | Implement `src/engine/benchmark.py` | Defines `measure_ttft()`, `measure_tpot()`, `sample_rss()`, and `sample_vram()` as composable utilities (no duplication with Phase 3/4 ad-hoc sampling — Phase 3/4 scripts should import from this module once it exists) |
 | 5.2 | TTFT measurement | `time.perf_counter()` delta from `generate()` call to first decoded token, per prompt P1–P3, averaged over 3 trials each |
 | 5.3 | TPOT measurement | `(output_tokens - 1) / (t_end - t_first_token)`, same trial structure |
 | 5.4 | RAM measurement | Peak `VmRSS` from `/proc/self/status`, sampled at 1 Hz throughout each trial |
-| 5.5 | Aggregate results | Write `results/metrics.csv` with columns: `prompt_id, trial, ttft_s, tpot_tok_s, peak_rss_gb, exit_code` |
-| 5.6 | Baseline-vs-AirLLM comparison table | Reproduce PRD §3.3's table with **actual measured numbers** replacing the "expected" placeholders |
-| 5.7 | Write the deep-dive technical report | `docs/REPORT.md` — sections: Methodology, Hardware/Software Config, Baseline Failure Analysis (with `results/baseline_stderr.log` excerpt), AirLLM Results, TTFT/TPOT/RAM Tables + analysis, Limitations, Conclusion |
-| 5.8 | Cross-check against PRD Acceptance Criteria | Walk PRD §5.4 line by line; mark each criterion pass/fail with evidence pointer |
+| 5.5 | VRAM measurement | Sample Intel iGPU memory allocation via `intel_gpu_top -J` (or `/sys/class/drm/card*/device/mem_info_vram_used` if exposed) at 1 Hz throughout each trial, confirming usage stays within the ≤ 128 MB ceiling per PRD §4.1; record `0 MB` explicitly if AirLLM never offloads to the iGPU on this run, since that is itself a meaningful result for the zero-VRAM thesis |
+| 5.6 | Aggregate results | Write `results/metrics.csv` with columns: `prompt_id, trial, ttft_s, tpot_tok_s, peak_rss_gb, peak_vram_mb, exit_code` |
+| 5.7 | Baseline-vs-AirLLM comparison table | Reproduce PRD §3.3's table with **actual measured numbers** (including VRAM) replacing the "expected" placeholders |
+| 5.8 | Write the deep-dive technical report | `docs/REPORT.md` — sections: Methodology, Hardware/Software Config, Baseline Failure Analysis (with `results/baseline_stderr.log` excerpt), AirLLM Results, TTFT/TPOT/RAM/VRAM Tables + analysis, Limitations, Conclusion |
+| 5.9 | Cross-check against PRD Acceptance Criteria | Walk PRD §5.4 line by line; mark each criterion pass/fail with evidence pointer |
 
 ### 6.3 Deliverables
 - `src/engine/benchmark.py`
 - `results/metrics.csv`
 - `docs/REPORT.md` (final deep-dive technical report — primary EX05 academic deliverable per PRD O6)
 
-### 6.4 Exit Criteria (Project Complete)
+### 6.4 Exit Criteria (Gate to Phase 6)
 - `docs/REPORT.md` published with all measured metrics, baseline failure evidence, and the comparison table fully populated (no "TBD" placeholders).
 - All PRD §5.4 acceptance criteria evaluated with explicit pass/fail and evidence.
 - `uv.lock` still in sync (`uv sync` exits `0`) — confirms PRD §5.3 reproducibility holds after the full experiment.
+- Sustained tokens/sec from `results/metrics.csv` available as the throughput input to Phase 6's cost model.
 
 ---
 
-## 7. Definition of Done
+## 7. Phase 6 — Economic Analysis
+
+This phase is a desk-research extension, not a code deliverable: it converts Phase 5's measured throughput into a cost comparison so the report can answer "is this actually worth running locally?" alongside "does it technically work?" This directly serves PRD O6 (document the pipeline to a full academic deliverable standard) by adding the cost dimension the core PRD scopes out of stability/latency metrics but a deep-dive technical report should still address.
+
+### 7.1 Entry Criteria
+- Phase 5 complete; `results/metrics.csv` contains measured TPOT (tokens/sec) for the selected model.
+
+### 7.2 Comparison Scenarios
+
+| Scenario | Description | Cost Basis |
+|----------|-------------|------------|
+| **A — On-Premises (this project)** | Existing WSL2 laptop, AirLLM, 4-bit quantized 7–8B model | Amortized hardware (sunk cost, already owned) + electricity only |
+| **B — Hosted Inference API** | Equivalent-class hosted model (e.g., a comparable 7–8B-class instruct model via a commercial inference API) | Published per-million-token pricing (input + output, priced separately) |
+| **C — Cloud GPU Rental** | Same 7B-class model run full-precision/fp16 on a rented cloud GPU instance (e.g., a single mid-tier datacenter GPU, on-demand hourly) | Published on-demand $/hour rate from the cloud provider's public pricing page, converted to $/1K tokens using the instance's typical throughput for a 7–8B model |
+
+### 7.3 Steps
+
+| # | Step | Detail |
+|---|------|--------|
+| 6.1 | Compute on-prem electricity cost | `(host TDP in kW) × (wall-clock seconds per Phase 5 run / 3600) × (local $/kWh)`; use a documented, cited $/kWh figure rather than an assumed one |
+| 6.2 | Collect Scenario B pricing | Record the provider's published $/M input tokens and $/M output tokens for a comparable model tier, with source URL and retrieval date, in `docs/REPORT.md` |
+| 6.3 | Collect Scenario C pricing | Record the cloud provider's published on-demand hourly GPU rate, with source URL and retrieval date; derive $/1K tokens using that GPU's documented or benchmarked throughput for a 7–8B model |
+| 6.4 | Normalize all three scenarios to a common unit | $ per 1,000 output tokens, using Phase 5's measured TPOT for Scenario A and the published/derived rates for B and C |
+| 6.5 | Build the comparison table | Columns: `Scenario, $/1K tokens, Latency class (TTFT), Setup overhead, Notes` |
+| 6.6 | State the break-even framing | At what monthly token volume does Scenario A's sunk-cost-only marginal cost become cheaper than B or C, given A's much lower throughput — present as a volume/latency trade-off, not a blanket "cheaper" claim |
+| 6.7 | Append to the final report | Add a "§6 Economic Analysis" section to `docs/REPORT.md` (written in Phase 5.8) with the table, the break-even framing, and explicit pricing sources/dates so the numbers are falsifiable and re-checkable later |
+
+### 7.4 Deliverables
+- `docs/REPORT.md` §"Economic Analysis" section: normalized $/1K-token comparison table, electricity cost derivation, and cited source links/dates for Scenarios B and C.
+
+### 7.5 Exit Criteria (Project Complete)
+- All three scenarios (A, B, C) are quantified in the same unit ($/1K output tokens) with sources cited for every externally-sourced number.
+- The trade-off is framed honestly: this project's on-prem path is a *latency-for-cost* trade against hosted alternatives, not a free win — the report must not claim cost superiority without the throughput caveat.
+- No pricing figure in the report is older than the project's experiment window without an explicit "as of [date]" annotation.
+
+---
+
+## 8. Definition of Done
 
 The project is considered complete when **all** of the following hold simultaneously:
 
-- [ ] Phases 1–5 exit criteria each satisfied (see per-phase §2.4, §3.6, §4.4, §5.5, §6.4).
-- [ ] `docs/REPORT.md` exists and is internally consistent with `results/*.csv`.
+- [ ] Phases 1–6 exit criteria each satisfied (see per-phase §2.4, §3.7, §4.4, §5.5, §6.4, §7.5).
+- [ ] `docs/REPORT.md` exists, is internally consistent with `results/*.csv`, and includes the Economic Analysis section from Phase 6.
 - [ ] `uv sync` + `uv run python scripts/run_inference.py` succeeds on a clean clone within the 10-minute PRD §5.3 budget.
 - [ ] No `pip`/`conda` invocation appears anywhere in scripts, docs, or `pyproject.toml`.
 - [ ] All P0/P1 objectives from PRD §3.2 (O1, O2, O3, O4, O5) are marked resolved with an evidence pointer into this plan or the report.
 
 ---
 
-## 8. Risk Carry-Forward
+## 9. Risk Carry-Forward
 
 Risks inherited from PRD §7 that materially affect execution of this plan; tracked here so phase owners check them at the relevant gate rather than re-discovering them mid-phase.
 
@@ -234,7 +285,8 @@ Risks inherited from PRD §7 that materially affect execution of this plan; trac
 | `bitsandbytes` CPU build unavailable | Phase 1, Phase 4 | Verify import succeeds in Phase 1.12; if INT4 path fails in Phase 4, fall back to fp16 AirLLM load and document the deviation in the report |
 | Disk I/O latency > 120 s/token | Phase 4, Phase 5 | If observed, treat as a characterization data point, not a blocking failure — record and explain, do not retry indefinitely |
 | WSL2 `.wslconfig` RAM cap < 12 GB | Phase 1, Phase 4 | Pre-flight check (step 4.4) surfaces this at runtime; if triggered, pause and have the user raise `wsl2.memory` before continuing |
+| Published API/GPU pricing changes after report is written | Phase 6 | Date-stamp every external price cited; treat the cost table as a snapshot, not a live figure |
 
 ---
 
-*End of Document — ZeroVRAM-AirLLM-Engine Implementation Plan v1.0.0*
+*End of Document — ZeroVRAM-AirLLM-Engine Implementation Plan v1.1.0*
